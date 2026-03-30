@@ -244,8 +244,17 @@ def main() -> int:
         print("--top must be > 0", file=sys.stderr)
         return 2
 
+    print(
+        f"Sampling container IO for {args.interval:.1f}s... (press Ctrl+C to stop)",
+        flush=True,
+    )
+
     start = snapshot_container_totals()
-    time.sleep(args.interval)
+    try:
+        time.sleep(args.interval)
+    except KeyboardInterrupt:
+        print("\nInterrupted before sampling window completed.", file=sys.stderr)
+        return 130
     end = snapshot_container_totals()
 
     all_ids = set(start.keys()) | set(end.keys())
@@ -263,4 +272,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        print("\nInterrupted.", file=sys.stderr)
+        raise SystemExit(130)
