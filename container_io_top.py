@@ -55,6 +55,7 @@ class CgroupContainerStats:
     wios_rate: float
     read_rate: float
     write_rate: float
+    avg_write_size: float
 
 
 @dataclass
@@ -604,6 +605,7 @@ def compute_cgroup_container_rates(
         wios_rate = wios / seconds
         read_rate = rbytes / seconds
         write_rate = wbytes / seconds
+        avg_write_size = (wbytes / wios) if wios > 0 else 0.0
 
         if not include_zero and rios + wios + rbytes + wbytes <= 0:
             continue
@@ -616,6 +618,7 @@ def compute_cgroup_container_rates(
                 wios_rate=wios_rate,
                 read_rate=read_rate,
                 write_rate=write_rate,
+                avg_write_size=avg_write_size,
             )
         )
 
@@ -719,9 +722,9 @@ def print_container_table(rows: list[ContainerStats], top_n: int, interval: floa
 def print_cgroup_table(rows: list[CgroupContainerStats], top_n: int, interval: float) -> None:
     print(f"Container cgroup io.stat over {interval:.1f}s")
     print(
-        f"{'CONTAINER':<36} {'RIOS/s':>10} {'WIOS/s':>10} {'READ':>16} {'WRITE':>16} {'TOTAL':>16}"
+        f"{'CONTAINER':<36} {'RIOS/s':>10} {'WIOS/s':>10} {'READ':>16} {'WRITE':>16} {'AVG_WRITE_SIZE':>16} {'TOTAL':>16}"
     )
-    print("-" * 108)
+    print("-" * 125)
 
     if not rows:
         print("(no cgroup io.stat activity detected)")
@@ -730,7 +733,7 @@ def print_cgroup_table(rows: list[CgroupContainerStats], top_n: int, interval: f
     for row in rows[:top_n]:
         total = row.read_rate + row.write_rate
         print(
-            f"{row.name:<36.36} {row.rios_rate:10.1f} {row.wios_rate:10.1f} {human_rate(row.read_rate):>16} {human_rate(row.write_rate):>16} {human_rate(total):>16}"
+            f"{row.name:<36.36} {row.rios_rate:10.1f} {row.wios_rate:10.1f} {human_rate(row.read_rate):>16} {human_rate(row.write_rate):>16} {human_bytes(row.avg_write_size):>16} {human_rate(total):>16}"
         )
 
 
