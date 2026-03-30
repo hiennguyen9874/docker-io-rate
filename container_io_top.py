@@ -56,6 +56,8 @@ class CgroupContainerStats:
     read_rate: float
     write_rate: float
     avg_write_size: float
+    offender_score: float
+    label: str
 
 
 @dataclass
@@ -606,6 +608,12 @@ def compute_cgroup_container_rates(
         read_rate = rbytes / seconds
         write_rate = wbytes / seconds
         avg_write_size = (wbytes / wios) if wios > 0 else 0.0
+        avg_write_kib = avg_write_size / 1024.0 if avg_write_size > 0 else 0.0
+        offender_score = (wios_rate / avg_write_kib) if avg_write_kib > 0 else 0.0
+
+        label = ""
+        if wios_rate >= 20.0 and avg_write_size <= 16 * 1024:
+            label = "SMALL_WRITE_HOT"
 
         if not include_zero and rios + wios + rbytes + wbytes <= 0:
             continue
@@ -619,6 +627,8 @@ def compute_cgroup_container_rates(
                 read_rate=read_rate,
                 write_rate=write_rate,
                 avg_write_size=avg_write_size,
+                offender_score=offender_score,
+                label=label,
             )
         )
 
@@ -722,9 +732,9 @@ def print_container_table(rows: list[ContainerStats], top_n: int, interval: floa
 def print_cgroup_table(rows: list[CgroupContainerStats], top_n: int, interval: float) -> None:
     print(f"Container cgroup io.stat over {interval:.1f}s")
     print(
-        f"{'CONTAINER':<36} {'RIOS/s':>10} {'WIOS/s':>10} {'READ':>16} {'WRITE':>16} {'AVG_WRITE_SIZE':>16} {'TOTAL':>16}"
+        f"{'CONTAINER':<36} {'RIOS/s':>10} {'WIOS/s':>10} {'READ':>16} {'WRITE':>16} {'AVG_WRITE_SIZE':>16} {'OFFENDER_SCORE':>16} {'LABEL':>18} {'TOTAL':>16}"
     )
-    print("-" * 125)
+    print("-" * 163)
 
     if not rows:
         print("(no cgroup io.stat activity detected)")
@@ -733,7 +743,9 @@ def print_cgroup_table(rows: list[CgroupContainerStats], top_n: int, interval: f
     for row in rows[:top_n]:
         total = row.read_rate + row.write_rate
         print(
-            f"{row.name:<36.36} {row.rios_rate:10.1f} {row.wios_rate:10.1f} {human_rate(row.read_rate):>16} {human_rate(row.write_rate):>16} {human_bytes(row.avg_write_size):>16} {human_rate(total):>16}"
+            f"{row.name:<36.36} {row.rios_rate:10.1f} {row.wios_rate:10.1f} {human_rate(row.read_rate):>16} "
+            f"{human_rate(row.write_rate):>16} {human_bytes(row.avg_write_size):>16} {row.offender_score:16.2f} "
+            f"{row.label:>18.18} {human_rate(total):>16}"
         )
 
 

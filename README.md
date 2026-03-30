@@ -104,6 +104,8 @@ sudo MODE=health INTERVAL=5 TOP=15 INCLUDE_ZERO=0 RESOLVE_NAME=1 SMART=0 ./watch
 - `RIOS/s`, `WIOS/s`: read/write IOPS
 - `READ`, `WRITE`: bytes/s
 - `AVG_WRITE_SIZE`: kích thước ghi trung bình mỗi write IO (`WRITE bytes / WIOS`)
+- `OFFENDER_SCORE`: điểm nghi ngờ small-write (`WIOS/s / AVG_WRITE_SIZE(KiB)`)
+- `LABEL`: tự động gắn `SMALL_WRITE_HOT` khi `WIOS/s` cao và `AVG_WRITE_SIZE` nhỏ
 - Dùng mode này để bắt case random small IO tốt hơn mode `container`
 
 ### `device` / `health` mode
@@ -147,18 +149,18 @@ Ví dụ output (rút gọn):
 
 ```text
 Container cgroup io.stat over 10.0s
-CONTAINER                                RIOS/s     WIOS/s             READ            WRITE   AVG_WRITE_SIZE            TOTAL
------------------------------------------------------------------------------------------------------------------------------
-core_cluster_2592x1944_0                    0.0       34.6          0.0 B/s        5.5 MiB/s        162.7 KiB        5.5 MiB/s
-coreai-kafka                                0.0      121.6          0.0 B/s      602.4 KiB/s          5.0 KiB      602.4 KiB/s
-trisv2-kafka                                0.0       13.6          0.0 B/s      132.0 KiB/s          9.7 KiB      132.0 KiB/s
+CONTAINER                                RIOS/s     WIOS/s             READ            WRITE   AVG_WRITE_SIZE   OFFENDER_SCORE              LABEL            TOTAL
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------
+core_cluster_2592x1944_0                    0.0       34.6          0.0 B/s        5.5 MiB/s        162.7 KiB             0.21                           5.5 MiB/s
+coreai-kafka                                0.0      121.6          0.0 B/s      602.4 KiB/s          5.0 KiB            24.32    SMALL_WRITE_HOT      602.4 KiB/s
+trisv2-kafka                                0.0       13.6          0.0 B/s      132.0 KiB/s          9.7 KiB             1.40                         132.0 KiB/s
 ```
 
 Cách đọc nhanh:
 
 - `core_cluster_*`: throughput cao, write size lớn hơn (đẩy bandwidth).
-- `coreai-kafka`: `WIOS/s` rất cao nhưng `AVG_WRITE_SIZE` rất nhỏ (~5 KiB) => small-write offender.
-- Container nào có `WIOS/s cao` + `AVG_WRITE_SIZE nhỏ` thường gây áp lực IOPS/queue/latency mạnh hơn.
+- `coreai-kafka`: `WIOS/s` rất cao nhưng `AVG_WRITE_SIZE` rất nhỏ (~5 KiB), `OFFENDER_SCORE` cao và dính `SMALL_WRITE_HOT`.
+- Container nào có `WIOS/s cao` + `AVG_WRITE_SIZE nhỏ` + `OFFENDER_SCORE` cao thường gây áp lực IOPS/queue/latency mạnh nhất.
 
 Rule thực dụng:
 
