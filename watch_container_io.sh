@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Realtime container disk IO monitor.
-# Default refresh every 30s (similar to repeated iotop snapshots).
+# Realtime container + device disk IO monitor.
 
 INTERVAL="${INTERVAL:-30}"
 TOP="${TOP:-20}"
 INCLUDE_ZERO="${INCLUDE_ZERO:-0}"
 RESOLVE_NAME="${RESOLVE_NAME:-1}"
+MODE="${MODE:-container}"
+INCLUDE_LOOP="${INCLUDE_LOOP:-0}"
+DEVICE_REGEX="${DEVICE_REGEX:-}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -17,16 +19,20 @@ Usage: watch_container_io.sh [options]
 
 Options:
   -i, --interval SEC     Sampling interval in seconds (default: 30)
-  -t, --top N            Show top N containers (default: 20)
-  -a, --all              Include containers with 0 B/s IO
-  --no-resolve-name      Show container ID instead of resolving docker names
+  -t, --top N            Show top N rows (default: 20)
+  -m, --mode MODE        container | device | full (default: container)
+  -a, --all              Include rows with 0 activity
+  --no-resolve-name      Show container ID instead of docker name
+  --include-loop         Include loop/ram devices (device/full mode)
+  --device-regex REGEX   Filter device name by regex (device/full mode)
   -h, --help             Show this help
 
 Environment variables (alternative config):
-  INTERVAL, TOP, INCLUDE_ZERO (0/1), RESOLVE_NAME (0/1), PYTHON_BIN
+  INTERVAL, TOP, MODE, INCLUDE_ZERO (0/1), RESOLVE_NAME (0/1),
+  INCLUDE_LOOP (0/1), DEVICE_REGEX, PYTHON_BIN
 
 Example:
-  sudo ./watch_container_io.sh --interval 15 --top 10
+  sudo ./watch_container_io.sh --mode full --interval 5 --top 15
 EOF
 }
 
@@ -40,6 +46,10 @@ while [[ $# -gt 0 ]]; do
       TOP="$2"
       shift 2
       ;;
+    -m|--mode)
+      MODE="$2"
+      shift 2
+      ;;
     -a|--all)
       INCLUDE_ZERO=1
       shift
@@ -47,6 +57,14 @@ while [[ $# -gt 0 ]]; do
     --no-resolve-name)
       RESOLVE_NAME=0
       shift
+      ;;
+    --include-loop)
+      INCLUDE_LOOP=1
+      shift
+      ;;
+    --device-regex)
+      DEVICE_REGEX="$2"
+      shift 2
       ;;
     -h|--help)
       usage
@@ -65,17 +83,28 @@ if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
   exit 1
 fi
 
-EXTRA_ARGS=()
+if [[ "$MODE" != "container" && "$MODE" != "device" && "$MODE" != "full" ]]; then
+  echo "Invalid mode: $MODE (must be container|device|full)" >&2
+  exit 2
+fi
+
+EXTRA_ARGS=(--mode "$MODE")
 if [[ "$INCLUDE_ZERO" == "1" ]]; then
   EXTRA_ARGS+=(--all)
 fi
 if [[ "$RESOLVE_NAME" != "1" ]]; then
   EXTRA_ARGS+=(--no-resolve-name)
 fi
+if [[ "$INCLUDE_LOOP" == "1" ]]; then
+  EXTRA_ARGS+=(--include-loop)
+fi
+if [[ -n "$DEVICE_REGEX" ]]; then
+  EXTRA_ARGS+=(--device-regex "$DEVICE_REGEX")
+fi
 
 while true; do
   clear
-  echo "$(date '+%Y-%m-%d %H:%M:%S %Z')"
+  date '+%Y-%m-%d %H:%M:%S %Z'
   echo
   "$PYTHON_BIN" "$SCRIPT_DIR/container_io_top.py" \
     --interval "$INTERVAL" \

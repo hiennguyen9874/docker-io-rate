@@ -1,147 +1,125 @@
-# Docker Container IO Rate Monitor
+# Docker Container + Disk IO Monitor
 
-Scripts để theo dõi container nào đang đọc/ghi đĩa nhiều, tương tự `iotop -oPa` nhưng gom theo container.
+Scripts để theo dõi container nào đang đọc/ghi đĩa nhiều, đồng thời theo dõi nghẽn IO ở level device và ước lượng pattern `sequential/random`.
 
 ## Files
 
-- `container_io_top.py`: thu thập I/O từ `/proc/<pid>/io`, map PID -> container, tính read/write rate theo chu kỳ lấy mẫu.
-- `watch_container_io.sh`: chạy realtime vòng lặp, hiển thị bảng container name + read/write rate.
+- `container_io_top.py`
+  - `container` mode: tương tự `iotop -oPa` nhưng gom theo container.
+  - `device` mode: chỉ số kiểu `iostat -x` từ `/proc/diskstats`.
+  - `full` mode: in cả container + device trong cùng 1 chu kỳ.
+- `watch_container_io.sh`
+  - realtime loop, refresh mỗi `interval` giây.
 
 ## Requirements
 
-- Linux host có `/proc`
+- Linux host có `/proc` và `/sys/block`
 - Python 3
 - Docker CLI (nếu muốn resolve container name)
 - Quyền đọc `/proc/<pid>/io` (thường cần `sudo`)
-
-## How It Works
-
-1. Script chụp snapshot tổng `read_bytes/write_bytes` của từng container tại thời điểm `T0`.
-2. Chờ đúng `interval` giây.
-3. Chụp snapshot lần 2 tại `T1`.
-4. Tính throughput: `(bytes_T1 - bytes_T0) / interval`.
-5. Sắp xếp theo tổng IO (`read + write`) và hiển thị top N.
-
-Lưu ý quan trọng: kết quả chỉ xuất hiện **sau khi hết interval**.
 
 ## Quick Start
 
 ```bash
 chmod +x container_io_top.py watch_container_io.sh
-sudo ./watch_container_io.sh --interval 3 --top 20
+sudo ./watch_container_io.sh --mode full --interval 5 --top 15
 ```
-
-Mặc định watcher:
-
-- interval: `30` giây
-- top: `20` containers
-- chỉ hiện containers có activity (`read/write > 0`)
 
 ## Usage
 
-### 1) One-shot bằng Python
+### 1) One-shot
 
 ```bash
-sudo ./container_io_top.py --interval 30 --top 20
+# Container throughput
+sudo ./container_io_top.py --mode container --interval 3 --top 20
+
+# Device metrics + pattern heuristic
+sudo ./container_io_top.py --mode device --interval 3 --top 10
+
+# Cả 2
+sudo ./container_io_top.py --mode full --interval 3 --top 10
 ```
 
-Options:
+### 2) Realtime watcher
+
+```bash
+sudo ./watch_container_io.sh --mode full --interval 5 --top 15
+```
+
+## Options (`container_io_top.py`)
 
 - `--interval <seconds>`: chu kỳ lấy mẫu
-- `--top <N>`: số container hiển thị
-- `--all`: bao gồm cả container 0 B/s
-- `--no-resolve-name`: không gọi `docker ps`, hiển thị container ID
+- `--top <N>`: số dòng hiển thị
+- `--all`: bao gồm cả row 0 activity
+- `--no-resolve-name`: không gọi `docker ps`
+- `--mode container|device|full`
+- `--include-loop`: include `loop*`/`ram*` khi mode device/full
+- `--device-regex <regex>`: lọc device name (vd `'^nvme|^sd'`)
 
-### 2) Realtime loop bằng Bash
+## Options (`watch_container_io.sh`)
 
-```bash
-sudo ./watch_container_io.sh
-```
-
-Options:
-
-- `-i, --interval <seconds>`
-- `-t, --top <N>`
+- `-i, --interval`
+- `-t, --top`
+- `-m, --mode container|device|full`
 - `-a, --all`
 - `--no-resolve-name`
+- `--include-loop`
+- `--device-regex`
 
-Ví dụ:
-
-```bash
-sudo ./watch_container_io.sh --interval 10 --top 10
-sudo ./watch_container_io.sh --interval 5 --top 15 --no-resolve-name
-sudo ./watch_container_io.sh --interval 3 --top 20 --all
-```
-
-## Configure via Environment Variables
+## Environment Variables
 
 ```bash
-sudo INTERVAL=15 TOP=10 INCLUDE_ZERO=1 RESOLVE_NAME=0 ./watch_container_io.sh
+sudo MODE=full INTERVAL=5 TOP=15 INCLUDE_ZERO=0 RESOLVE_NAME=1 ./watch_container_io.sh
 ```
 
-Supported vars:
-
+- `MODE` (`container|device|full`)
 - `INTERVAL` (default `30`)
 - `TOP` (default `20`)
 - `INCLUDE_ZERO` (`0`/`1`)
 - `RESOLVE_NAME` (`0`/`1`)
+- `INCLUDE_LOOP` (`0`/`1`)
+- `DEVICE_REGEX` (default empty)
 - `PYTHON_BIN` (default `python3`)
 
-## Practical Debug Guide
+## Cách đọc output device mode
 
-### Symptom: "Không thấy gì", rồi Ctrl+C ra `KeyboardInterrupt`
+- `READ/WRITE`: throughput theo device
+- `RPS/WPS`: số read/write IO mỗi giây (IOPS)
+- `%UTIL`: phần trăm thời gian device bận xử lý IO
+- `AWAIT` (ms): latency trung bình mỗi IO
+- `AVGQ`: queue depth trung bình
+- `REQ_KB`: kích thước request trung bình
+- `MERGE%`: tỷ lệ request được merge ở block layer
+- `PATTERN`: `LIKELY_SEQ` / `LIKELY_RANDOM` / `MIXED` / `IDLE` (heuristic)
 
-Nguyên nhân: bạn dừng trước khi hết `interval`.
+## Quan trọng về sequential vs random
 
-Ví dụ nếu `interval=30`, script cần chờ ~30 giây mới in bảng.
+`PATTERN` chỉ là ước lượng từ `REQ_KB` + `MERGE%`, không phải ground truth 100%.
+Nếu cần chính xác cao, dùng thêm eBPF/blktrace (`biosnoop`, `biolatency`, `blktrace`) để thấy block offset theo thời gian.
 
-Cách xử lý:
+## Debug nhanh khi "không hiện gì"
 
-```bash
-sudo ./watch_container_io.sh --interval 3 --top 10
-```
-
-Chờ tối thiểu 1 chu kỳ (3 giây trong ví dụ) trước khi kết luận không có output.
-
-### Debug Checklist
-
-1. Kiểm tra script one-shot có dữ liệu:
-
-```bash
-sudo ./container_io_top.py --interval 3 --top 20 --all --no-resolve-name
-```
-
-2. Kiểm tra Docker containers đang chạy:
+1. Script chỉ in kết quả sau khi hết `interval`.
+2. Dùng interval ngắn để test:
 
 ```bash
-docker ps --format 'table {{.ID}}\t{{.Names}}\t{{.Status}}'
+sudo ./container_io_top.py --mode full --interval 3 --top 10 --all
 ```
 
-3. Kiểm tra cgroup path có docker scope:
+3. Bật trace shell watcher:
 
 ```bash
-sudo sh -c "grep -H 'docker-.*scope' /proc/[0-9]*/cgroup | head -n 30"
+sudo bash -x ./watch_container_io.sh --mode full --interval 3 --top 10
 ```
 
-4. Nếu muốn trace watcher:
+4. Lọc device chính:
 
 ```bash
-sudo bash -x ./watch_container_io.sh --interval 3 --top 10
+sudo ./container_io_top.py --mode device --interval 3 --device-regex '^nvme|^sd|^vd'
 ```
 
-### Tạo IO test để xác minh
+## Limitations
 
-Chạy lệnh ghi dữ liệu trong một container:
-
-```bash
-docker exec -it <container_name> sh -c 'dd if=/dev/zero of=/tmp/io-test bs=1M count=200 oflag=direct; sync'
-```
-
-Sau đó chạy lại monitor để thấy write rate tăng.
-
-## Notes / Limitations
-
-- Script đọc `read_bytes`/`write_bytes` từ `/proc/<pid>/io` và cộng theo container.
-- Nếu Docker CLI không có hoặc không truy cập daemon, script vẫn chạy nhưng hiển thị container ID.
-- Có thể miss process rất ngắn sống giữa 2 snapshot.
-- Nếu host dùng runtime/cgroup layout khác biệt lớn, parser có thể cần điều chỉnh regex/path.
+- Container mode dựa trên cộng `/proc/<pid>/io`, có thể miss process rất ngắn sống giữa 2 snapshot.
+- Không map trực tiếp được random/seq theo từng container chỉ bằng `/proc/<pid>/io`.
+- Với overlay/network storage, latency có thể đến từ tầng storage backend, không chỉ local disk.
