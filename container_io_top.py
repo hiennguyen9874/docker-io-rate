@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Container and device disk IO monitor.
 
-- container mode: per-container read/write throughput from /proc/<pid>/io
-- device mode: per-device iostat-like metrics from /proc/diskstats
-- full mode: print both views in one sampling window
+Modes:
+- container: per-container read/write throughput from /proc/<pid>/io
+- cgroup: per-container cgroup v2 io.stat throughput + IOPS
+- device: per-device iostat-like metrics from /proc/diskstats
+- full: print container + cgroup + device in one sampling window
+- health: device metrics + host pressure/swap/fs saturation + alerts
 """
 
 from __future__ import annotations
@@ -11,6 +14,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -20,6 +24,7 @@ from typing import Dict, Iterable, Optional, Tuple
 CONTAINER_ID_RE = re.compile(r"([0-9a-f]{64}|[0-9a-f]{32})")
 PROC_DIR = "/proc"
 SYS_BLOCK = "/sys/block"
+CGROUP_ROOT = "/sys/fs/cgroup"
 
 
 @dataclass
@@ -31,6 +36,23 @@ class IoStats:
 @dataclass
 class ContainerStats:
     name: str
+    read_rate: float
+    write_rate: float
+
+
+@dataclass
+class CgroupIoStat:
+    rios: int
+    wios: int
+    rbytes: int
+    wbytes: int
+
+
+@dataclass
+class CgroupContainerStats:
+    name: str
+    rios_rate: float
+    wios_rate: float
     read_rate: float
     write_rate: float
 
@@ -65,9 +87,30 @@ class DeviceRates:
     pattern: str
 
 
+@dataclass
+class PressureTotals:
+    some_us: int
+    full_us: int
+
+
+@dataclass
+class HealthSnapshot:
+    pressure: PressureTotals
+    pswpin: int
+    pswpout: int
+    dirty_bytes: int
+    writeback_bytes: int
+
+
+@dataclass
+class SmartHealth:
+    device: str
+    status: str
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Monitor container and device disk IO over a sampling interval",
+        description="Monitor container/device disk IO and host disk pressure",
     )
     parser.add_argument(
         "--interval",
@@ -93,19 +136,24 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--mode",
-        choices=("container", "device", "full"),
+        choices=("container", "cgroup", "device", "full", "health"),
         default="container",
-        help="container: per-container throughput, device: iostat-like, full: both",
+        help="container|cgroup|device|full|health",
     )
     parser.add_argument(
         "--include-loop",
         action="store_true",
-        help="Include loop/ram devices in device mode",
+        help="Include loop/ram devices in device/full/health mode",
     )
     parser.add_argument(
         "--device-regex",
         default="",
-        help="Only include device names matching regex (device/full mode)",
+        help="Only include device names matching regex (device/full/health mode)",
+    )
+    parser.add_argument(
+        "--smart",
+        action="store_true",
+        help="In health mode, query SMART overall health (requires smartctl)",
     )
     return parser.parse_args()
 
@@ -127,8 +175,18 @@ def parse_container_id_from_cgroup(content: str) -> Optional[str]:
     return best
 
 
-def pid_container_map() -> Dict[int, str]:
-    result: Dict[int, str] = {}
+def parse_cgroup_v2_path(content: str) -> Optional[str]:
+    for line in content.splitlines():
+        parts = line.split(":", 2)
+        if len(parts) == 3 and parts[0] == "0" and parts[1] == "":
+            path = parts[2].strip()
+            if path.startswith("/"):
+                return path
+    return None
+
+
+def pid_container_info_map() -> Dict[int, Tuple[str, Optional[str]]]:
+    result: Dict[int, Tuple[str, Optional[str]]] = {}
     for entry in os.scandir(PROC_DIR):
         if not entry.name.isdigit():
             continue
@@ -140,10 +198,29 @@ def pid_container_map() -> Dict[int, str]:
             continue
 
         cid = parse_container_id_from_cgroup(content)
-        if cid:
-            result[pid] = cid
+        if not cid:
+            continue
+
+        cg_v2_path = parse_cgroup_v2_path(content)
+        result[pid] = (cid, cg_v2_path)
 
     return result
+
+
+def pid_container_map() -> Dict[int, str]:
+    info = pid_container_info_map()
+    return {pid: item[0] for pid, item in info.items()}
+
+
+def container_cgroup_map() -> Dict[str, str]:
+    cid_to_path: Dict[str, str] = {}
+    for _pid, (cid, cgpath) in pid_container_info_map().items():
+        if not cgpath:
+            continue
+        prev = cid_to_path.get(cid)
+        if prev is None or len(cgpath) > len(prev):
+            cid_to_path[cid] = cgpath
+    return cid_to_path
 
 
 def parse_io_file(pid: int) -> Optional[IoStats]:
@@ -179,6 +256,40 @@ def snapshot_container_totals() -> Dict[str, IoStats]:
             totals[cid] = (prev[0] + stats.read_bytes, prev[1] + stats.write_bytes)
 
     return {cid: IoStats(r, w) for cid, (r, w) in totals.items()}
+
+
+def parse_cgroup_io_stat(content: str) -> CgroupIoStat:
+    rios = wios = rbytes = wbytes = 0
+    for line in content.splitlines():
+        # Example: "8:0 rbytes=123 wbytes=456 rios=7 wios=8 dbytes=0 dios=0"
+        for token in line.split()[1:]:
+            if "=" not in token:
+                continue
+            k, v = token.split("=", 1)
+            try:
+                num = int(v)
+            except ValueError:
+                continue
+            if k == "rios":
+                rios += num
+            elif k == "wios":
+                wios += num
+            elif k == "rbytes":
+                rbytes += num
+            elif k == "wbytes":
+                wbytes += num
+    return CgroupIoStat(rios=rios, wios=wios, rbytes=rbytes, wbytes=wbytes)
+
+
+def snapshot_cgroup_container_totals() -> Dict[str, CgroupIoStat]:
+    snap: Dict[str, CgroupIoStat] = {}
+    for cid, cgpath in container_cgroup_map().items():
+        io_stat_path = os.path.join(CGROUP_ROOT, cgpath.lstrip("/"), "io.stat")
+        content = read_file(io_stat_path)
+        if not content:
+            continue
+        snap[cid] = parse_cgroup_io_stat(content)
+    return snap
 
 
 def resolve_container_names(ids: Iterable[str]) -> Dict[str, str]:
@@ -280,6 +391,146 @@ def snapshot_diskstats(include_loop: bool, device_re: Optional[re.Pattern[str]])
     return snap
 
 
+def parse_pressure_io() -> PressureTotals:
+    content = read_file("/proc/pressure/io") or ""
+    some_total = 0
+    full_total = 0
+    for line in content.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split()
+        kind = parts[0]
+        total_val = 0
+        for token in parts[1:]:
+            if token.startswith("total="):
+                try:
+                    total_val = int(token.split("=", 1)[1])
+                except ValueError:
+                    total_val = 0
+                break
+        if kind == "some":
+            some_total = total_val
+        elif kind == "full":
+            full_total = total_val
+    return PressureTotals(some_us=some_total, full_us=full_total)
+
+
+def parse_vmstat(keys: Iterable[str]) -> Dict[str, int]:
+    wanted = set(keys)
+    out: Dict[str, int] = {k: 0 for k in wanted}
+    content = read_file("/proc/vmstat") or ""
+    for line in content.splitlines():
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        k, v = parts
+        if k not in wanted:
+            continue
+        try:
+            out[k] = int(v)
+        except ValueError:
+            out[k] = 0
+    return out
+
+
+def parse_meminfo() -> Tuple[int, int]:
+    dirty_kb = 0
+    writeback_kb = 0
+    content = read_file("/proc/meminfo") or ""
+    for line in content.splitlines():
+        if line.startswith("Dirty:"):
+            try:
+                dirty_kb = int(line.split()[1])
+            except (ValueError, IndexError):
+                dirty_kb = 0
+        elif line.startswith("Writeback:"):
+            try:
+                writeback_kb = int(line.split()[1])
+            except (ValueError, IndexError):
+                writeback_kb = 0
+    return dirty_kb * 1024, writeback_kb * 1024
+
+
+def snapshot_health() -> HealthSnapshot:
+    vm = parse_vmstat(["pswpin", "pswpout"])
+    dirty_bytes, writeback_bytes = parse_meminfo()
+    return HealthSnapshot(
+        pressure=parse_pressure_io(),
+        pswpin=vm.get("pswpin", 0),
+        pswpout=vm.get("pswpout", 0),
+        dirty_bytes=dirty_bytes,
+        writeback_bytes=writeback_bytes,
+    )
+
+
+def parse_df_percent(args: list[str]) -> list[Tuple[str, str, int]]:
+    # returns [(filesystem, mountpoint, used_percent)]
+    try:
+        output = subprocess.check_output(args, text=True, stderr=subprocess.DEVNULL)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return []
+
+    rows: list[Tuple[str, str, int]] = []
+    lines = output.splitlines()
+    for line in lines[1:]:
+        parts = line.split()
+        if len(parts) < 6:
+            continue
+        fs = parts[0]
+        used_pct_raw = parts[4]
+        mount = parts[5]
+        try:
+            used_pct = int(used_pct_raw.rstrip("%"))
+        except ValueError:
+            continue
+        rows.append((fs, mount, used_pct))
+    return rows
+
+
+def list_network_mounts() -> list[Tuple[str, str, str]]:
+    mounts: list[Tuple[str, str, str]] = []
+    content = read_file("/proc/mounts") or ""
+    for line in content.splitlines():
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        source, mountpoint, fstype = parts[0], parts[1], parts[2]
+        if fstype.startswith("nfs") or "ceph" in fstype:
+            mounts.append((source, mountpoint, fstype))
+    return mounts
+
+
+def collect_smart_health(devices: Iterable[str]) -> list[SmartHealth]:
+    if shutil.which("smartctl") is None:
+        return []
+
+    out: list[SmartHealth] = []
+    for dev in devices:
+        path = f"/dev/{dev}"
+        try:
+            text = subprocess.check_output(
+                ["smartctl", "-H", path],
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            continue
+
+        status = "UNKNOWN"
+        for line in text.splitlines():
+            u = line.upper()
+            if "PASSED" in u or "OK" in u:
+                status = "PASSED"
+                break
+            if "FAILED" in u or "BAD" in u:
+                status = "FAILED"
+                break
+        out.append(SmartHealth(device=dev, status=status))
+
+    return out
+
+
 def human_rate(num_bytes_per_sec: float) -> str:
     units = ["B/s", "KiB/s", "MiB/s", "GiB/s", "TiB/s"]
     value = float(num_bytes_per_sec)
@@ -288,6 +539,16 @@ def human_rate(num_bytes_per_sec: float) -> str:
             return f"{value:8.1f} {unit}"
         value /= 1024.0
     return f"{value:8.1f} TiB/s"
+
+
+def human_bytes(num_bytes: float) -> str:
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
+    value = float(num_bytes)
+    for unit in units:
+        if abs(value) < 1024.0 or unit == units[-1]:
+            return f"{value:8.1f} {unit}"
+        value /= 1024.0
+    return f"{value:8.1f} TiB"
 
 
 def compute_container_rates(
@@ -315,6 +576,48 @@ def compute_container_rates(
 
         cname = id_to_name.get(cid, cid[:12])
         rows.append(ContainerStats(name=cname, read_rate=read_rate, write_rate=write_rate))
+
+    rows.sort(key=lambda x: x.read_rate + x.write_rate, reverse=True)
+    return rows
+
+
+def compute_cgroup_container_rates(
+    start: Dict[str, CgroupIoStat],
+    end: Dict[str, CgroupIoStat],
+    seconds: float,
+    include_zero: bool,
+    id_to_name: Dict[str, str],
+) -> list[CgroupContainerStats]:
+    containers = sorted(set(start.keys()) | set(end.keys()))
+    rows: list[CgroupContainerStats] = []
+
+    for cid in containers:
+        s = start.get(cid, CgroupIoStat(0, 0, 0, 0))
+        e = end.get(cid, CgroupIoStat(0, 0, 0, 0))
+
+        rios = max(0, e.rios - s.rios)
+        wios = max(0, e.wios - s.wios)
+        rbytes = max(0, e.rbytes - s.rbytes)
+        wbytes = max(0, e.wbytes - s.wbytes)
+
+        rios_rate = rios / seconds
+        wios_rate = wios / seconds
+        read_rate = rbytes / seconds
+        write_rate = wbytes / seconds
+
+        if not include_zero and rios + wios + rbytes + wbytes <= 0:
+            continue
+
+        cname = id_to_name.get(cid, cid[:12])
+        rows.append(
+            CgroupContainerStats(
+                name=cname,
+                rios_rate=rios_rate,
+                wios_rate=wios_rate,
+                read_rate=read_rate,
+                write_rate=write_rate,
+            )
+        )
 
     rows.sort(key=lambda x: x.read_rate + x.write_rate, reverse=True)
     return rows
@@ -413,6 +716,24 @@ def print_container_table(rows: list[ContainerStats], top_n: int, interval: floa
         )
 
 
+def print_cgroup_table(rows: list[CgroupContainerStats], top_n: int, interval: float) -> None:
+    print(f"Container cgroup io.stat over {interval:.1f}s")
+    print(
+        f"{'CONTAINER':<36} {'RIOS/s':>10} {'WIOS/s':>10} {'READ':>16} {'WRITE':>16} {'TOTAL':>16}"
+    )
+    print("-" * 108)
+
+    if not rows:
+        print("(no cgroup io.stat activity detected)")
+        return
+
+    for row in rows[:top_n]:
+        total = row.read_rate + row.write_rate
+        print(
+            f"{row.name:<36.36} {row.rios_rate:10.1f} {row.wios_rate:10.1f} {human_rate(row.read_rate):>16} {human_rate(row.write_rate):>16} {human_rate(total):>16}"
+        )
+
+
 def print_device_table(rows: list[DeviceRates], top_n: int, interval: float) -> None:
     print(f"Device IO over {interval:.1f}s")
     print(
@@ -429,6 +750,121 @@ def print_device_table(rows: list[DeviceRates], top_n: int, interval: float) -> 
             f"{row.device:<10.10} {row.rps:7.1f} {row.wps:7.1f} {human_rate(row.read_bps):>12} {human_rate(row.write_bps):>12} "
             f"{row.util_pct:7.1f} {row.await_ms:8.2f} {row.avgqu_sz:7.2f} {row.avg_req_kb:8.1f} {row.merge_pct:8.1f} {row.pattern:>15}"
         )
+
+
+def build_health_alerts(
+    device_rows: list[DeviceRates],
+    health_start: HealthSnapshot,
+    health_end: HealthSnapshot,
+    fs_usage: list[Tuple[str, str, int]],
+    inode_usage: list[Tuple[str, str, int]],
+    network_mounts: list[Tuple[str, str, str]],
+    seconds: float,
+    smart_health: list[SmartHealth],
+) -> list[str]:
+    alerts: list[str] = []
+
+    util_thr = 90.0
+    await_thr = 20.0
+    avgq_thr = 2.0
+    psi_thr_msps = 50.0
+    swap_thr_pages = 10.0
+    dirty_thr_bytes = 1024 * 1024 * 1024
+    fs_thr = 90
+
+    for row in device_rows:
+        if row.util_pct >= util_thr:
+            alerts.append(f"device {row.device}: high util {row.util_pct:.1f}%")
+        if row.await_ms >= await_thr:
+            alerts.append(f"device {row.device}: high await {row.await_ms:.2f} ms")
+        if row.avgqu_sz >= avgq_thr:
+            alerts.append(f"device {row.device}: high queue depth {row.avgqu_sz:.2f}")
+        if row.pattern == "LIKELY_RANDOM" and (row.rps + row.wps) >= 100.0:
+            alerts.append(f"device {row.device}: random small IO pressure (pattern={row.pattern}, iops={row.rps + row.wps:.1f})")
+
+    d_some_us = max(0, health_end.pressure.some_us - health_start.pressure.some_us)
+    d_full_us = max(0, health_end.pressure.full_us - health_start.pressure.full_us)
+    some_msps = (d_some_us / 1000.0) / seconds
+    full_msps = (d_full_us / 1000.0) / seconds
+    if some_msps >= psi_thr_msps:
+        alerts.append(f"IO PSI some is high: {some_msps:.1f} ms/s")
+    if full_msps >= psi_thr_msps:
+        alerts.append(f"IO PSI full is high: {full_msps:.1f} ms/s")
+
+    swpin_ps = max(0, health_end.pswpin - health_start.pswpin) / seconds
+    swpout_ps = max(0, health_end.pswpout - health_start.pswpout) / seconds
+    if swpin_ps >= swap_thr_pages or swpout_ps >= swap_thr_pages:
+        alerts.append(f"swap activity elevated: pswpin={swpin_ps:.1f}/s pswpout={swpout_ps:.1f}/s")
+
+    if health_end.dirty_bytes >= dirty_thr_bytes:
+        alerts.append(f"dirty memory is high: {human_bytes(health_end.dirty_bytes)}")
+    if health_end.writeback_bytes >= dirty_thr_bytes:
+        alerts.append(f"writeback memory is high: {human_bytes(health_end.writeback_bytes)}")
+
+    for fs, mount, used in fs_usage:
+        if used >= fs_thr:
+            alerts.append(f"filesystem usage high: {mount} ({fs}) {used}%")
+
+    for fs, mount, used in inode_usage:
+        if used >= fs_thr:
+            alerts.append(f"inode usage high: {mount} ({fs}) {used}%")
+
+    if network_mounts:
+        alerts.append("network storage mounts detected (NFS/Ceph); backend latency can dominate IO")
+
+    for s in smart_health:
+        if s.status == "FAILED":
+            alerts.append(f"SMART health failed on {s.device}")
+
+    return alerts
+
+
+def print_health_section(
+    health_start: HealthSnapshot,
+    health_end: HealthSnapshot,
+    fs_usage: list[Tuple[str, str, int]],
+    inode_usage: list[Tuple[str, str, int]],
+    network_mounts: list[Tuple[str, str, str]],
+    smart_health: list[SmartHealth],
+    seconds: float,
+) -> None:
+    d_some_us = max(0, health_end.pressure.some_us - health_start.pressure.some_us)
+    d_full_us = max(0, health_end.pressure.full_us - health_start.pressure.full_us)
+    some_msps = (d_some_us / 1000.0) / seconds
+    full_msps = (d_full_us / 1000.0) / seconds
+
+    swpin_ps = max(0, health_end.pswpin - health_start.pswpin) / seconds
+    swpout_ps = max(0, health_end.pswpout - health_start.pswpout) / seconds
+
+    print("Host IO Health")
+    print("-" * 88)
+    print(f"IO PSI some: {some_msps:.2f} ms/s")
+    print(f"IO PSI full: {full_msps:.2f} ms/s")
+    print(f"Swap activity: pswpin={swpin_ps:.2f}/s pswpout={swpout_ps:.2f}/s")
+    print(f"Dirty memory: {human_bytes(health_end.dirty_bytes)}")
+    print(f"Writeback memory: {human_bytes(health_end.writeback_bytes)}")
+
+    if fs_usage:
+        worst_fs = sorted(fs_usage, key=lambda x: x[2], reverse=True)[:3]
+        print("Top filesystem usage:")
+        for fs, mount, used in worst_fs:
+            print(f"  {mount} ({fs}): {used}%")
+
+    if inode_usage:
+        worst_inode = sorted(inode_usage, key=lambda x: x[2], reverse=True)[:3]
+        print("Top inode usage:")
+        for fs, mount, used in worst_inode:
+            print(f"  {mount} ({fs}): {used}%")
+
+    if network_mounts:
+        print("Network mounts (NFS/Ceph):")
+        for src, mount, fstype in network_mounts[:5]:
+            print(f"  {mount} <- {src} ({fstype})")
+
+    if smart_health:
+        print("SMART health:")
+        for s in smart_health:
+            print(f"  {s.device}: {s.status}")
 
 
 def main() -> int:
@@ -456,13 +892,21 @@ def main() -> int:
 
     c_start: Dict[str, IoStats] = {}
     c_end: Dict[str, IoStats] = {}
+    cg_start: Dict[str, CgroupIoStat] = {}
+    cg_end: Dict[str, CgroupIoStat] = {}
     d_start: Dict[str, DiskStats] = {}
     d_end: Dict[str, DiskStats] = {}
+    h_start: Optional[HealthSnapshot] = None
+    h_end: Optional[HealthSnapshot] = None
 
     if args.mode in ("container", "full"):
         c_start = snapshot_container_totals()
-    if args.mode in ("device", "full"):
+    if args.mode in ("cgroup", "full"):
+        cg_start = snapshot_cgroup_container_totals()
+    if args.mode in ("device", "full", "health"):
         d_start = snapshot_diskstats(args.include_loop, device_re)
+    if args.mode == "health":
+        h_start = snapshot_health()
 
     try:
         time.sleep(args.interval)
@@ -472,8 +916,12 @@ def main() -> int:
 
     if args.mode in ("container", "full"):
         c_end = snapshot_container_totals()
-    if args.mode in ("device", "full"):
+    if args.mode in ("cgroup", "full"):
+        cg_end = snapshot_cgroup_container_totals()
+    if args.mode in ("device", "full", "health"):
         d_end = snapshot_diskstats(args.include_loop, device_re)
+    if args.mode == "health":
+        h_end = snapshot_health()
 
     if args.mode in ("container", "full"):
         all_ids = set(c_start.keys()) | set(c_end.keys())
@@ -490,7 +938,22 @@ def main() -> int:
     if args.mode == "full":
         print()
 
-    if args.mode in ("device", "full"):
+    if args.mode in ("cgroup", "full"):
+        all_ids = set(cg_start.keys()) | set(cg_end.keys())
+        id_to_name = {} if args.no_resolve_name else resolve_container_names(all_ids)
+        cg_rows = compute_cgroup_container_rates(
+            start=cg_start,
+            end=cg_end,
+            seconds=args.interval,
+            include_zero=args.all,
+            id_to_name=id_to_name,
+        )
+        print_cgroup_table(cg_rows, top_n=args.top, interval=args.interval)
+
+    if args.mode in ("full", "cgroup"):
+        print()
+
+    if args.mode in ("device", "full", "health"):
         d_rows = compute_device_rates(
             start=d_start,
             end=d_end,
@@ -498,9 +961,48 @@ def main() -> int:
             include_zero=args.all,
         )
         print_device_table(d_rows, top_n=args.top, interval=args.interval)
-
         print()
         print("Pattern note: LIKELY_SEQ/LIKELY_RANDOM is heuristic from req size + merge ratio.")
+
+    if args.mode == "health" and h_start and h_end:
+        fs_usage = parse_df_percent(["df", "-P"])
+        inode_usage = parse_df_percent(["df", "-Pi"])
+        network_mounts = list_network_mounts()
+
+        smart_health: list[SmartHealth] = []
+        if args.smart:
+            smart_health = collect_smart_health(d_end.keys())
+
+        print()
+        print_health_section(
+            health_start=h_start,
+            health_end=h_end,
+            fs_usage=fs_usage,
+            inode_usage=inode_usage,
+            network_mounts=network_mounts,
+            smart_health=smart_health,
+            seconds=args.interval,
+        )
+
+        alerts = build_health_alerts(
+            device_rows=d_rows,
+            health_start=h_start,
+            health_end=h_end,
+            fs_usage=fs_usage,
+            inode_usage=inode_usage,
+            network_mounts=network_mounts,
+            seconds=args.interval,
+            smart_health=smart_health,
+        )
+
+        print()
+        print("Health Alerts")
+        print("-" * 88)
+        if alerts:
+            for item in alerts:
+                print(f"- {item}")
+        else:
+            print("- no obvious pressure signals in this sampling window")
 
     return 0
 
