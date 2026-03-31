@@ -25,7 +25,7 @@ Scripts để theo dõi nguyên nhân nghẽn disk IO theo nhiều lớp: contai
 
 ```bash
 chmod +x container_io_top.py watch_container_io.sh
-sudo ./watch_container_io.sh --mode full --interval 5 --top 15
+sudo ./watch_container_io.sh --mode full --interval 10 --top 15
 ```
 
 ## Modes
@@ -33,37 +33,37 @@ sudo ./watch_container_io.sh --mode full --interval 5 --top 15
 ### 1) Container throughput (iotop-like)
 
 ```bash
-sudo ./container_io_top.py --mode container --interval 3 --top 20
+sudo ./container_io_top.py --mode container --interval 10 --top 20
 ```
 
 ### 2) Container cgroup IO (bytes + IOPS)
 
 ```bash
-sudo ./container_io_top.py --mode cgroup --interval 3 --top 20
+sudo ./container_io_top.py --mode cgroup --interval 10 --top 20
 ```
 
 ### 3) Device view (iostat-like)
 
 ```bash
-sudo ./container_io_top.py --mode device --interval 3 --top 10
+sudo ./container_io_top.py --mode device --interval 10 --top 10
 ```
 
 ### 4) Full view
 
 ```bash
-sudo ./container_io_top.py --mode full --interval 3 --top 10
+sudo ./container_io_top.py --mode full --interval 10 --top 10
 ```
 
 ### 5) Health view (root cause signals)
 
 ```bash
-sudo ./container_io_top.py --mode health --interval 5 --top 10
+sudo ./container_io_top.py --mode health --interval 10 --top 10
 ```
 
 ## Watcher
 
 ```bash
-sudo ./watch_container_io.sh --mode health --interval 5 --top 15
+sudo ./watch_container_io.sh --mode health --interval 10 --top 15
 ```
 
 ## CLI Options (`container_io_top.py`)
