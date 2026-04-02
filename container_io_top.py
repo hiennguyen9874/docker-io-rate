@@ -12,6 +12,7 @@ Modes:
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import os
 import re
 import shutil
@@ -157,6 +158,14 @@ def parse_args() -> argparse.Namespace:
         "--smart",
         action="store_true",
         help="In health mode, query SMART overall health (requires smartctl)",
+    )
+    parser.add_argument(
+        "--container-filter",
+        default="",
+        help=(
+            "Filter container names with shell wildcards like '*_a' or 'a_*'. "
+            "Use 're:<pattern>' for regex."
+        ),
     )
     return parser.parse_args()
 
@@ -326,6 +335,16 @@ def resolve_container_names(ids: Iterable[str]) -> Dict[str, str]:
                 break
 
     return resolved
+
+
+def compile_container_filter(expr: str) -> Optional[re.Pattern[str]]:
+    if not expr:
+        return None
+    if expr.startswith("re:"):
+        pattern = expr[3:]
+    else:
+        pattern = fnmatch.translate(expr)
+    return re.compile(pattern)
 
 
 def get_block_devices(include_loop: bool) -> set[str]:
@@ -560,6 +579,7 @@ def compute_container_rates(
     seconds: float,
     include_zero: bool,
     id_to_name: Dict[str, str],
+    container_filter: Optional[re.Pattern[str]],
 ) -> list[ContainerStats]:
     containers = sorted(set(start.keys()) | set(end.keys()))
     rows: list[ContainerStats] = []
@@ -578,6 +598,8 @@ def compute_container_rates(
             continue
 
         cname = id_to_name.get(cid, cid[:12])
+        if container_filter and not container_filter.search(cname):
+            continue
         rows.append(ContainerStats(name=cname, read_rate=read_rate, write_rate=write_rate))
 
     rows.sort(key=lambda x: x.read_rate + x.write_rate, reverse=True)
@@ -590,6 +612,7 @@ def compute_cgroup_container_rates(
     seconds: float,
     include_zero: bool,
     id_to_name: Dict[str, str],
+    container_filter: Optional[re.Pattern[str]],
 ) -> list[CgroupContainerStats]:
     containers = sorted(set(start.keys()) | set(end.keys()))
     rows: list[CgroupContainerStats] = []
@@ -619,6 +642,8 @@ def compute_cgroup_container_rates(
             continue
 
         cname = id_to_name.get(cid, cid[:12])
+        if container_filter and not container_filter.search(cname):
+            continue
         rows.append(
             CgroupContainerStats(
                 name=cname,
@@ -892,6 +917,14 @@ def main() -> int:
         print("--top must be > 0", file=sys.stderr)
         return 2
 
+    container_filter: Optional[re.Pattern[str]] = None
+    if args.container_filter:
+        try:
+            container_filter = compile_container_filter(args.container_filter)
+        except re.error as exc:
+            print(f"Invalid --container-filter: {exc}", file=sys.stderr)
+            return 2
+
     device_re: Optional[re.Pattern[str]] = None
     if args.device_regex:
         try:
@@ -947,6 +980,7 @@ def main() -> int:
             seconds=args.interval,
             include_zero=args.all,
             id_to_name=id_to_name,
+            container_filter=container_filter,
         )
         print_container_table(c_rows, top_n=args.top, interval=args.interval)
 
@@ -962,6 +996,7 @@ def main() -> int:
             seconds=args.interval,
             include_zero=args.all,
             id_to_name=id_to_name,
+            container_filter=container_filter,
         )
         print_cgroup_table(cg_rows, top_n=args.top, interval=args.interval)
 

@@ -11,6 +11,7 @@ MODE="${MODE:-container}"
 INCLUDE_LOOP="${INCLUDE_LOOP:-0}"
 DEVICE_REGEX="${DEVICE_REGEX:-}"
 SMART="${SMART:-0}"
+CONTAINER_FILTER="${CONTAINER_FILTER:-}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -27,11 +28,14 @@ Options:
   --include-loop         Include loop/ram devices (device/full/health mode)
   --device-regex REGEX   Filter device name by regex (device/full/health mode)
   --smart                Query SMART health (health mode)
+  --container-filter EXPR
+                         Filter container names with wildcards like '*_a', 'a_*', '*abc*'
+                         or regex via 're:<pattern>' (container/cgroup/full mode)
   -h, --help             Show this help
 
 Environment variables (alternative config):
   INTERVAL, TOP, MODE, INCLUDE_ZERO (0/1), RESOLVE_NAME (0/1),
-  INCLUDE_LOOP (0/1), DEVICE_REGEX, SMART (0/1), PYTHON_BIN
+  INCLUDE_LOOP (0/1), DEVICE_REGEX, SMART (0/1), CONTAINER_FILTER, PYTHON_BIN
 
 Example:
   sudo ./watch_container_io.sh --mode health --interval 5 --top 15
@@ -72,6 +76,10 @@ while [[ $# -gt 0 ]]; do
       SMART=1
       shift
       ;;
+    --container-filter)
+      CONTAINER_FILTER="$2"
+      shift 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -109,6 +117,9 @@ if [[ -n "$DEVICE_REGEX" ]]; then
 fi
 if [[ "$SMART" == "1" ]]; then
   EXTRA_ARGS+=(--smart)
+fi
+if [[ -n "$CONTAINER_FILTER" ]]; then
+  EXTRA_ARGS+=(--container-filter "$CONTAINER_FILTER")
 fi
 
 while true; do

@@ -76,6 +76,7 @@ sudo ./watch_container_io.sh --mode health --interval 10 --top 15
 - `--include-loop`
 - `--device-regex <regex>`
 - `--smart` (health mode)
+- `--container-filter <expr>`: shell wildcard mặc định (`*_a`, `a_*`, `*kafka*`), dùng `re:<pattern>` nếu muốn regex thật
 
 ## CLI Options (`watch_container_io.sh`)
 
@@ -87,6 +88,7 @@ sudo ./watch_container_io.sh --mode health --interval 10 --top 15
 - `--include-loop`
 - `--device-regex`
 - `--smart`
+- `--container-filter`
 
 ## Environment Variables
 
@@ -95,7 +97,25 @@ sudo MODE=health INTERVAL=5 TOP=15 INCLUDE_ZERO=0 RESOLVE_NAME=1 SMART=0 ./watch
 ```
 
 - `MODE`, `INTERVAL`, `TOP`, `INCLUDE_ZERO`, `RESOLVE_NAME`
-- `INCLUDE_LOOP`, `DEVICE_REGEX`, `SMART`, `PYTHON_BIN`
+- `INCLUDE_LOOP`, `DEVICE_REGEX`, `SMART`, `CONTAINER_FILTER`, `PYTHON_BIN`
+
+## Lọc container theo tên
+
+Lọc được ở `container`, `cgroup`, và `full` mode.
+
+Ví dụ wildcard:
+
+```bash
+sudo ./container_io_top.py --mode container --interval 5 --container-filter '*_a'
+sudo ./container_io_top.py --mode cgroup --interval 5 --container-filter 'a_*'
+sudo ./watch_container_io.sh --mode full --interval 5 --container-filter '*kafka*'
+```
+
+Ví dụ regex:
+
+```bash
+sudo ./container_io_top.py --mode container --interval 5 --container-filter 're:^core.*_(a|b)$'
+```
 
 ## Cách đọc output
 
